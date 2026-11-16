@@ -190,7 +190,7 @@ struct WebviewGui::Impl {
 			if (!Uint8Array.fromBase64) {
 				Uint8Array.fromBase64 = b64 => {
 					let binaryString = atob(b64);
-					let array = new Uint8Array(b64.length);
+					let array = new Uint8Array(binaryString.length);
 					for (let i=0; i < array.length; ++i) {
 						array[i] = binaryString.charCodeAt(i);
 					}
@@ -198,10 +198,15 @@ struct WebviewGui::Impl {
 				};
 			}
 			window.addEventListener('message', e=>{
-				if (e.source == window) { // this happens if we attempt to send using `window.parent` from the main frame
-					e.stopImmediatePropagation();
+				// Outgoing: `window.parent.postMessage()` from the main frame arrives here with source == window.
+				// Incoming messages (WebviewGui::send) carry source == window too, as the spec's window.parent, so
+				// pages that check event.source accept them. They're synthetic (isTrusted false); postMessage's are not.
+				if (e.source == window && e.isTrusted) {
 					let data = e.data;
 					if (data instanceof ArrayBuffer) data = new Uint8Array(data);
+					else if (ArrayBuffer.isView(data)) data = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+					else return; // not a binary frame (e.g. a page's own JSON debug message): leave it to the page
+					e.stopImmediatePropagation();
 					window.webkit.messageHandlers.webviewGui_receive.postMessage(data.toBase64());
 				}
 			}, {capture: true});
@@ -308,7 +313,8 @@ void WebviewGui::attach(void *platformNative) {
 	callVoid((id)platformNative, "addSubview:", impl->webview);
 }
 void WebviewGui::send(const unsigned char *bytes, size_t length) {
-	std::string js = "window.dispatchEvent(new MessageEvent('message',{data:Uint8Array.fromBase64('";
+	// source: window, which is window.parent for the main frame (pages may check event.source === window.parent)
+	std::string js = "window.dispatchEvent(new MessageEvent('message',{source:window,data:Uint8Array.fromBase64('";
 	helpers::encodeBase64(bytes, length, js);
 	js += "').buffer}))";
 
