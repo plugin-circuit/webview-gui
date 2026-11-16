@@ -55,7 +55,7 @@ namespace _objc {
 struct WebviewGui::Impl {
 	WebviewGui *main = nullptr;
 	id webview = nullptr;
-	id messageHandler = nullptr, schemeHandler = nullptr;
+	id messageHandler = nullptr, schemeHandler = nullptr, uiDelegate = nullptr;
 	ResourceGetter getter;
 
 	static constexpr const char * associatedObjectKey = "WebviewGui::Impl";
@@ -87,6 +87,34 @@ struct WebviewGui::Impl {
 		class_addMethod(handlerClass, sel_registerName("userContentController:didReceiveScriptMessage:"), (IMP)messageHandlerImpl, "v@:@@");
 		objc_registerClassPair(handlerClass);
 		
+		return (id)objc_getClass(className);
+	}
+
+	// <input type="file">: WebKit shows no file dialog unless the UI delegate does. A modal NSOpenPanel, with the
+	// page's multiple / directory flags; cancel answers nil.
+	static void openPanelImpl(id /*self*/, SEL, id /*webview*/, id parameters, id /*frame*/, void *completionHandler) {
+		using namespace _objc;
+		id panel = callSimple("NSOpenPanel", "openPanel");
+		const bool multiple = callSimple<bool>(parameters, "allowsMultipleSelection");
+		const bool directories = callSimple<bool>(parameters, "allowsDirectories");
+		callVoid(panel, "setCanChooseFiles:", (signed char)1);
+		callVoid(panel, "setCanChooseDirectories:", (signed char)(directories ? 1 : 0));
+		callVoid(panel, "setAllowsMultipleSelection:", (signed char)(multiple ? 1 : 0));
+		const long response = callSimple<long>(panel, "runModal");
+		id urls = response == 1 /*NSModalResponseOK*/ ? callSimple(panel, "URLs") : nil;
+		// call the completion block: void (^)(NSArray<NSURL *> *)
+		struct BlockLayout { void *isa; int flags; int reserved; void (*invoke)(void *, id); };
+		auto *block = (BlockLayout *)completionHandler;
+		if (block && block->invoke) block->invoke(block, urls);
+	}
+	static id createUIDelegateClass() {
+		static constexpr const char *className = "WebviewGUI_WKUIDelegate";
+		id alreadyRegistered = (id)objc_getClass(className);
+		if (alreadyRegistered) return alreadyRegistered;
+		auto delegateClass = objc_allocateClassPair(objc_getClass("NSObject"), className, 0);
+		class_addProtocol(delegateClass, objc_getProtocol("WKUIDelegate"));
+		class_addMethod(delegateClass, sel_registerName("webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:"), (IMP)openPanelImpl, "v@:@@@@?");
+		objc_registerClassPair(delegateClass);
 		return (id)objc_getClass(className);
 	}
 
@@ -235,6 +263,12 @@ struct WebviewGui::Impl {
 		webview = callSimple("WKWebView", "alloc");
 		CGRect frame{{0, 0}, {100, 100}};
 		if (webview) webview = callSimple(webview, "initWithFrame:configuration:", frame, config);
+		if (webview) {
+			// the webview holds its UI delegate weakly: we keep it
+			static id uiDelegateClass = createUIDelegateClass();
+			uiDelegate = callSimple(uiDelegateClass, "new");
+			callVoid(webview, "setUIDelegate:", uiDelegate);
+		}
 	}
 	
 	~Impl() {
@@ -242,9 +276,11 @@ struct WebviewGui::Impl {
 		if (messageHandler) objc_setAssociatedObject(messageHandler, associatedObjectKey, (id)nullptr, OBJC_ASSOCIATION_ASSIGN);
 		if (schemeHandler) objc_setAssociatedObject(schemeHandler, associatedObjectKey, (id)nullptr, OBJC_ASSOCIATION_ASSIGN);
 		if (webview) {
+			callVoid(webview, "setUIDelegate:", (id)nullptr);
 			callVoid(webview, "removeFromSuperview");
 			callVoid(webview, "release");
 		}
+		if (uiDelegate) callVoid(uiDelegate, "release");
 	}
 };
 
