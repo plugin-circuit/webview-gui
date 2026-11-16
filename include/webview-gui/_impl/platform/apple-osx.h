@@ -210,6 +210,16 @@ struct WebviewGui::Impl {
 					window.webkit.messageHandlers.webviewGui_receive.postMessage(data.toBase64());
 				}
 			}, {capture: true});
+			// A plugin GUI is not a web page: no browser context menu (the page's own handlers still get the event
+			// and can draw their menus), and no scroll bars. The document itself doesn't scroll (a page a few pixels
+			// larger than its view shouldn't wobble); scrollable panels inside it still scroll, without bars.
+			window.addEventListener('contextmenu', e => e.preventDefault(), {capture: true});
+			(() => {
+				const style = document.createElement('style');
+				style.textContent = 'html, body { overflow: hidden !important; } * { scrollbar-width: none !important; }'
+					+ ' ::-webkit-scrollbar { display: none !important; width: 0 !important; height: 0 !important; }';
+				(document.head || document.documentElement).appendChild(style);
+			})();
 		)JS";
 		id initScript = callSimple("WKUserScript", "alloc");
 		SCOPED_RELEASE(initScript);
