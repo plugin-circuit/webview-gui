@@ -174,6 +174,12 @@ struct WebviewGui::Impl {
 		callBlock(completionHandler, text);
 		if (text) callVoid(text, "release");
 	}
+	// Pointer lock (endless knob drags): WKWebView grants it only through this private WKUIDelegatePrivate method
+	// (macOS 10.14.4+); without it every request is refused. A plugin's page is its own: allow. If WebKit ever stops
+	// calling it, requests are refused as before, and pages fall back to plain drags.
+	static void pointerLockImpl(id /*self*/, SEL, id /*webview*/, void *completionHandler) {
+		_objc::callBlock(completionHandler, (signed char)1);
+	}
 	static id createUIDelegateClass() {
 		static constexpr const char *className = "WebviewGUI_WKUIDelegate";
 		id alreadyRegistered = (id)objc_getClass(className);
@@ -185,6 +191,7 @@ struct WebviewGui::Impl {
 		class_addMethod(delegateClass, sel_registerName("webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:"), (IMP)alertPanelImpl, "v@:@@@@?");
 		class_addMethod(delegateClass, sel_registerName("webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:completionHandler:"), (IMP)confirmPanelImpl, "v@:@@@@?");
 		class_addMethod(delegateClass, sel_registerName("webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:completionHandler:"), (IMP)promptPanelImpl, "v@:@@@@@?");
+		class_addMethod(delegateClass, sel_registerName("_webViewDidRequestPointerLock:completionHandler:"), (IMP)pointerLockImpl, "v@:@@?");
 		objc_registerClassPair(delegateClass);
 		return (id)objc_getClass(className);
 	}
