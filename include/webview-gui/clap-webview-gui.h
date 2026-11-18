@@ -133,7 +133,7 @@ struct ClapWebviewGui {
 				bool success = pluginWebview->get_resource(plugin, path, mediaType, 255, &resourceStream);
 				if (success) resource.mediaType = mediaType;
 				return success;
-			});
+			}, originHostFor(plugin));
 		}
 		if (!ptr) return false;
 
@@ -270,6 +270,41 @@ private:
 		return startUrlBuffer;
 	}
 	
+	// The plugin's id as a hostname, so each plugin's page gets its own origin (and storage): lowercase letters, digits,
+	// dots and dashes (anything else becomes a dash), labels of at most 63 characters, at most 253 in all.
+	static std::string originHostFor(const clap_plugin *p) {
+		std::string host;
+		const char *id = (p && p->desc && p->desc->id) ? p->desc->id : "";
+		size_t label = 0;
+		for (const char *c = id; *c && host.size() < 253; ++c) {
+			char ch = *c;
+			if (ch >= 'A' && ch <= 'Z') ch = char(ch - 'A' + 'a');
+			const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '.';
+			if (!ok) ch = '-';
+			if (ch == '.') {
+				if (label == 0) continue; // no empty labels
+				label = 0;
+			} else if (++label > 63) {
+				continue;
+			}
+			host += ch;
+		}
+		// a label may not start or end with a dash: trim each, drop the empty ones
+		std::string clean, part;
+		auto flush = [&] {
+			while (!part.empty() && part.front() == '-') part.erase(part.begin());
+			while (!part.empty() && part.back() == '-') part.pop_back();
+			if (!part.empty()) clean += (clean.empty() ? "" : ".") + part;
+			part.clear();
+		};
+		for (char ch : host) {
+			if (ch == '.') flush();
+			else part += ch;
+		}
+		flush();
+		return clean;
+	}
+
 	static bool isAbsolute(const char *uri) {
 		if (*uri == ':') return false; // absolute URIs can't start with `:`
 		while (*uri) {

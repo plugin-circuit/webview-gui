@@ -258,7 +258,9 @@ struct WebviewGui::Impl {
 		id request = callSimple(urlSchemeTask, "request");
 		id url = callSimple(request, "URL");
 		auto *urlStr = callSimple<const char *>(callSimple(url, "absoluteString"), "UTF8String");
-		auto *pathStr = urlStr + std::strlen("webview-gui://"); // using `path` or similar will remove trailing `/`
+		// the path after the origin host (using `path` or similar would remove a trailing `/`)
+		auto *pathStr = urlStr + std::strlen("webview-gui://");
+		if (const char *slash = std::strchr(pathStr, '/')) pathStr = slash;
 		Resource resource;
 		resource.mediaType = helpers::guessMediaType(pathStr);
 		if (!impl->getter(pathStr, resource)) {
@@ -432,10 +434,15 @@ bool WebviewGui::supports(Platform p) {
 	return p == Platform::COCOA;
 }
 WebviewGui * WebviewGui::create(Platform platform, const std::string &startPath, ResourceGetter getter) {
+	return create(platform, startPath, std::move(getter), std::string());
+}
+WebviewGui * WebviewGui::create(Platform platform, const std::string &startPath, ResourceGetter getter, const std::string &originHost) {
 	if (!supports(platform)) return nullptr;
 	
 	using namespace _objc;
-	id baseUrl = callSimple("NSURL", "URLWithString:", nsString("webview-gui://"));
+	// webview-gui://<host>/: the host makes the page's origin, so each host gets its own storage
+	const std::string base = "webview-gui://" + originHost + "/";
+	id baseUrl = callSimple("NSURL", "URLWithString:", nsString(base.c_str()));
 	if (!baseUrl) return nullptr;
 	id url = callSimple("NSURL", "URLWithString:relativeToURL:", nsString(startPath.c_str()), baseUrl);
 	auto *request = _objc::callSimple("NSMutableURLRequest", "requestWithURL:", url);

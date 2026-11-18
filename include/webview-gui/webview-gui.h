@@ -33,6 +33,11 @@ struct WebviewGui {
 	// The starting URL may be relative for these:
 	WEBVIEW_GUI_IMPL static WebviewGui * create(Platform platform, const std::string &startUrl, const std::string &baseDir);
 	WEBVIEW_GUI_IMPL static WebviewGui * create(Platform platform, const std::string &startUrl, ResourceGetter getter);
+	// As above, with the page's origin host (e.g. a sanitized plugin id): pages with different hosts get separate
+	// storage (localStorage, IndexedDB), so plugins can't read or overwrite each other's. Empty: the shared default.
+	// (macOS so far; other backends ignore the host.)
+	WEBVIEW_GUI_IMPL static WebviewGui * create(Platform platform, const std::string &startUrl, ResourceGetter getter,
+	                                            const std::string &originHost);
 	WEBVIEW_GUI_IMPL ~WebviewGui();
 	
 	// Convenience template for creating shared/unique pointers

@@ -143,6 +143,11 @@ WebviewGui * WebviewGui::create(WebviewGui::Platform p, const std::string &start
 	return new WebviewGui(impl);
 }
 
+// The origin host isn't applied here yet (CHOC's custom scheme URI is fixed): every page shares one origin, as before.
+WebviewGui * WebviewGui::create(WebviewGui::Platform p, const std::string &startPath, WebviewGui::ResourceGetter getter,
+                                const std::string &) {
+	return create(p, startPath, std::move(getter));
+}
 WebviewGui * WebviewGui::create(WebviewGui::Platform p, const std::string &startUrl) {
 	return create(p, startUrl, [](const char *path, Resource &resource){
 		// No custom resources - the start URL needs to be absolute
