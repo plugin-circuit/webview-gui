@@ -7,6 +7,8 @@
 #include <objc/runtime.h>
 #include <objc/message.h>
 
+#include <cstring>
+
 namespace webview_gui {
 
 // Objective-C helpers - we use `objc_msgSend` for "simple" return values (not structs, not floating-point)
@@ -42,6 +44,24 @@ namespace _objc {
 		return callSimple<bool>(obj, "isKindOfClass:", (id)objc_getClass(className));
 	}
 	
+	// Calls an Objective-C block (a completion or decision handler) with these arguments: the block ABI's layout,
+	// since this file is C++ talking to the runtime.
+	template<class... Args>
+	inline void callBlock(void *block, Args... args) {
+		struct BlockLayout { void *isa; int flags; int reserved; void (*invoke)(void *, Args...); };
+		auto *b = (BlockLayout *)block;
+		if (b && b->invoke) b->invoke(b, args...);
+	}
+
+	// http(s) and mailto links open in the user's browser / mail app, never inside the plugin's GUI
+	inline bool openExternally(id url) {
+		if (!url) return false;
+		id scheme = callSimple(url, "scheme");
+		auto *s = scheme ? callSimple<const char *>(callSimple(scheme, "lowercaseString"), "UTF8String") : "";
+		if (std::strcmp(s, "http") && std::strcmp(s, "https") && std::strcmp(s, "mailto")) return false;
+		return callSimple<bool>(callSimple("NSWorkspace", "sharedWorkspace"), "openURL:", url);
+	}
+
 	struct ScopedRelease {
 		id obj;
 		ScopedRelease(id obj) : obj(obj) {}
@@ -55,7 +75,8 @@ namespace _objc {
 struct WebviewGui::Impl {
 	WebviewGui *main = nullptr;
 	id webview = nullptr;
-	id messageHandler = nullptr, schemeHandler = nullptr, uiDelegate = nullptr;
+	id messageHandler = nullptr, schemeHandler = nullptr, uiDelegate = nullptr, navigationDelegate = nullptr,
+	   downloadDelegate = nullptr;
 	ResourceGetter getter;
 
 	static constexpr const char * associatedObjectKey = "WebviewGui::Impl";
@@ -107,6 +128,52 @@ struct WebviewGui::Impl {
 		auto *block = (BlockLayout *)completionHandler;
 		if (block && block->invoke) block->invoke(block, urls);
 	}
+	// window.open() and target="_blank": no window inside the plugin; http(s) links open in the browser
+	static id createWebViewImpl(id /*self*/, SEL, id /*webview*/, id /*config*/, id navigationAction, id /*features*/) {
+		using namespace _objc;
+		openExternally(callSimple(callSimple(navigationAction, "request"), "URL"));
+		return nil;
+	}
+	// alert(), confirm(), prompt(): without these, WebKit returns at once (confirm false, prompt null)
+	static id makeAlert(id message) {
+		using namespace _objc;
+		id alert = callSimple("NSAlert", "new");
+		callVoid(alert, "setMessageText:", message ? message : nsString(""));
+		callSimple(alert, "addButtonWithTitle:", nsString("OK"));
+		return alert;
+	}
+	static void alertPanelImpl(id /*self*/, SEL, id /*webview*/, id message, id /*frame*/, void *completionHandler) {
+		using namespace _objc;
+		id alert = makeAlert(message);
+		callSimple<long>(alert, "runModal");
+		callVoid(alert, "release");
+		callBlock(completionHandler);
+	}
+	static void confirmPanelImpl(id /*self*/, SEL, id /*webview*/, id message, id /*frame*/, void *completionHandler) {
+		using namespace _objc;
+		id alert = makeAlert(message);
+		callSimple(alert, "addButtonWithTitle:", nsString("Cancel"));
+		const long response = callSimple<long>(alert, "runModal");
+		callVoid(alert, "release");
+		callBlock(completionHandler, (signed char)(response == 1000 /*NSAlertFirstButtonReturn*/ ? 1 : 0));
+	}
+	static void promptPanelImpl(id /*self*/, SEL, id /*webview*/, id prompt, id defaultText, id /*frame*/, void *completionHandler) {
+		using namespace _objc;
+		id alert = makeAlert(prompt);
+		callSimple(alert, "addButtonWithTitle:", nsString("Cancel"));
+		id field = callSimple("NSTextField", "alloc");
+		CGRect frame{{0, 0}, {280, 24}};
+		field = callSimple(field, "initWithFrame:", frame);
+		callVoid(field, "setStringValue:", defaultText ? defaultText : nsString(""));
+		callVoid(alert, "setAccessoryView:", field);
+		callVoid(callSimple(alert, "window"), "setInitialFirstResponder:", field);
+		const long response = callSimple<long>(alert, "runModal");
+		id text = response == 1000 ? callSimple(callSimple(field, "stringValue"), "copy") : nil;
+		callVoid(field, "release");
+		callVoid(alert, "release");
+		callBlock(completionHandler, text);
+		if (text) callVoid(text, "release");
+	}
 	static id createUIDelegateClass() {
 		static constexpr const char *className = "WebviewGUI_WKUIDelegate";
 		id alreadyRegistered = (id)objc_getClass(className);
@@ -114,6 +181,72 @@ struct WebviewGui::Impl {
 		auto delegateClass = objc_allocateClassPair(objc_getClass("NSObject"), className, 0);
 		class_addProtocol(delegateClass, objc_getProtocol("WKUIDelegate"));
 		class_addMethod(delegateClass, sel_registerName("webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:"), (IMP)openPanelImpl, "v@:@@@@?");
+		class_addMethod(delegateClass, sel_registerName("webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:"), (IMP)createWebViewImpl, "@@:@@@@");
+		class_addMethod(delegateClass, sel_registerName("webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:"), (IMP)alertPanelImpl, "v@:@@@@?");
+		class_addMethod(delegateClass, sel_registerName("webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:completionHandler:"), (IMP)confirmPanelImpl, "v@:@@@@?");
+		class_addMethod(delegateClass, sel_registerName("webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:completionHandler:"), (IMP)promptPanelImpl, "v@:@@@@@?");
+		objc_registerClassPair(delegateClass);
+		return (id)objc_getClass(className);
+	}
+
+	// Downloads (<a download>, blob: URLs, responses the page can't show) become a WKDownload (macOS 11.3+), saved
+	// where the user picks in a save panel. Without this, WebKit drops them: an "Export" button did nothing.
+	static void decideActionImpl(id /*self*/, SEL, id webview, id action, void *decisionHandler) {
+		using namespace _objc;
+		if (callSimple<bool>(action, "shouldPerformDownload")) return callBlock(decisionHandler, long(2) /*...PolicyDownload*/);
+		// a link the user clicked to another site: the browser, not the plugin's GUI (whose page would be lost)
+		id target = callSimple(action, "targetFrame");
+		const bool mainFrame = target && callSimple<bool>(target, "isMainFrame");
+		if (mainFrame && callSimple<long>(action, "navigationType") == 0 /*WKNavigationTypeLinkActivated*/) {
+			id url = callSimple(callSimple(action, "request"), "URL");
+			id current = callSimple(webview, "URL");
+			auto text = [](id s) { return s ? s : nsString(""); };
+			const bool sameSite = current && callSimple<bool>(text(callSimple(url, "scheme")), "isEqualToString:", text(callSimple(current, "scheme")))
+			                      && callSimple<bool>(text(callSimple(url, "host")), "isEqualToString:", text(callSimple(current, "host")));
+			if (!sameSite && openExternally(url)) return callBlock(decisionHandler, long(0) /*...PolicyCancel*/);
+		}
+		callBlock(decisionHandler, long(1) /*WKNavigationActionPolicyAllow*/);
+	}
+	static void decideResponseImpl(id /*self*/, SEL, id /*webview*/, id response, void *decisionHandler) {
+		using namespace _objc;
+		const bool canShow = callSimple<bool>(response, "canShowMIMEType");
+		callBlock(decisionHandler, long(canShow ? 1 /*Allow*/ : 2 /*WKNavigationResponsePolicyDownload*/));
+	}
+	static void didBecomeDownloadImpl(id self, SEL, id /*webview*/, id /*actionOrResponse*/, id download) {
+		using namespace _objc;
+		auto *impl = (Impl *)objc_getAssociatedObject(self, associatedObjectKey);
+		if (impl && impl->downloadDelegate) callVoid(download, "setDelegate:", impl->downloadDelegate);
+	}
+	static void downloadDestinationImpl(id /*self*/, SEL, id /*download*/, id /*response*/, id suggestedFilename, void *completionHandler) {
+		using namespace _objc;
+		id panel = callSimple("NSSavePanel", "savePanel");
+		if (suggestedFilename) callVoid(panel, "setNameFieldStringValue:", suggestedFilename);
+		const long result = callSimple<long>(panel, "runModal");
+		id url = result == 1 /*NSModalResponseOK*/ ? callSimple(panel, "URL") : nil;
+		// WKDownload fails if the file exists; the panel has already asked whether to replace it
+		if (url) callSimple<bool>(callSimple("NSFileManager", "defaultManager"), "removeItemAtURL:error:", url, (id *)nullptr);
+		callBlock(completionHandler, url);
+	}
+	static id createNavigationDelegateClass() {
+		static constexpr const char *className = "WebviewGUI_WKNavigationDelegate";
+		id alreadyRegistered = (id)objc_getClass(className);
+		if (alreadyRegistered) return alreadyRegistered;
+		auto delegateClass = objc_allocateClassPair(objc_getClass("NSObject"), className, 0);
+		class_addProtocol(delegateClass, objc_getProtocol("WKNavigationDelegate"));
+		class_addMethod(delegateClass, sel_registerName("webView:decidePolicyForNavigationAction:decisionHandler:"), (IMP)decideActionImpl, "v@:@@@?");
+		class_addMethod(delegateClass, sel_registerName("webView:decidePolicyForNavigationResponse:decisionHandler:"), (IMP)decideResponseImpl, "v@:@@@?");
+		class_addMethod(delegateClass, sel_registerName("webView:navigationAction:didBecomeDownload:"), (IMP)didBecomeDownloadImpl, "v@:@@@");
+		class_addMethod(delegateClass, sel_registerName("webView:navigationResponse:didBecomeDownload:"), (IMP)didBecomeDownloadImpl, "v@:@@@");
+		objc_registerClassPair(delegateClass);
+		return (id)objc_getClass(className);
+	}
+	static id createDownloadDelegateClass() {
+		static constexpr const char *className = "WebviewGUI_WKDownloadDelegate";
+		id alreadyRegistered = (id)objc_getClass(className);
+		if (alreadyRegistered) return alreadyRegistered;
+		auto delegateClass = objc_allocateClassPair(objc_getClass("NSObject"), className, 0);
+		if (auto *protocol = objc_getProtocol("WKDownloadDelegate")) class_addProtocol(delegateClass, protocol);
+		class_addMethod(delegateClass, sel_registerName("download:decideDestinationUsingResponse:suggestedFilename:completionHandler:"), (IMP)downloadDestinationImpl, "v@:@@@@?");
 		objc_registerClassPair(delegateClass);
 		return (id)objc_getClass(className);
 	}
@@ -268,6 +401,13 @@ struct WebviewGui::Impl {
 			static id uiDelegateClass = createUIDelegateClass();
 			uiDelegate = callSimple(uiDelegateClass, "new");
 			callVoid(webview, "setUIDelegate:", uiDelegate);
+			// navigation and downloads: held here too (WebKit holds both delegates weakly)
+			static id navigationDelegateClass = createNavigationDelegateClass();
+			static id downloadDelegateClass = createDownloadDelegateClass();
+			navigationDelegate = callSimple(navigationDelegateClass, "new");
+			downloadDelegate = callSimple(downloadDelegateClass, "new");
+			objc_setAssociatedObject(navigationDelegate, associatedObjectKey, (id)this, OBJC_ASSOCIATION_ASSIGN);
+			callVoid(webview, "setNavigationDelegate:", navigationDelegate);
 		}
 	}
 	
@@ -275,12 +415,16 @@ struct WebviewGui::Impl {
 		using namespace _objc;
 		if (messageHandler) objc_setAssociatedObject(messageHandler, associatedObjectKey, (id)nullptr, OBJC_ASSOCIATION_ASSIGN);
 		if (schemeHandler) objc_setAssociatedObject(schemeHandler, associatedObjectKey, (id)nullptr, OBJC_ASSOCIATION_ASSIGN);
+		if (navigationDelegate) objc_setAssociatedObject(navigationDelegate, associatedObjectKey, (id)nullptr, OBJC_ASSOCIATION_ASSIGN);
 		if (webview) {
 			callVoid(webview, "setUIDelegate:", (id)nullptr);
+			callVoid(webview, "setNavigationDelegate:", (id)nullptr);
 			callVoid(webview, "removeFromSuperview");
 			callVoid(webview, "release");
 		}
 		if (uiDelegate) callVoid(uiDelegate, "release");
+		if (navigationDelegate) callVoid(navigationDelegate, "release");
+		if (downloadDelegate) callVoid(downloadDelegate, "release"); // a download in progress keeps no pointer to us
 	}
 };
 
